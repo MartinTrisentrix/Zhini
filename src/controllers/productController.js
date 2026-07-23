@@ -3,9 +3,10 @@ import { ObjectId } from "mongodb";
 import { GoogleGenAI, Type } from "@google/genai";
 
 
+
 const mongoUri = process.env.MONGODB_URI;
 
-const ai = new GoogleGenAI({ apiKey: "AIzaSyCQv3jxyd3eFyEteDioW217cGbkLS6Nxgs" });
+
 
 export const createProductSubmission = async (c) => {
   try {
@@ -98,6 +99,44 @@ export const createProductSubmission = async (c) => {
 };
 
 
+export const updateHomeAddress = async (c) => {
+  try {
+    const homeId = c.req.param('homeId');
+    const { address, pincode } = await c.req.json();
+
+    if (!homeId || !ObjectId.isValid(homeId)) {
+      return c.json({ success: false, message: 'Invalid homeId' }, 400);
+    }
+
+    const updateFields = {};
+    if (address !== undefined) updateFields.address = address.trim();
+    if (pincode !== undefined) updateFields.pincode = pincode.toString().trim();
+
+    updateFields.updatedAt = new Date().toISOString();
+
+    const result = await withDatabase(mongoUri, async (db) => {
+      return await db.collection('Home').findOneAndUpdate(
+        { _id: new ObjectId(homeId) },
+        { $set: updateFields },
+        { returnDocument: 'after' }
+      );
+    });
+
+    if (!result) {
+      return c.json({ success: false, message: 'Home not found' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      message: 'Address updated successfully',
+      data: result
+    });
+
+  } catch (error) {
+    return c.json({ success: false, message: error.message }, 500);
+  }
+};
+
 // Helper function — extracts a 6-digit pincode from an address string
 function extractPincodeFromAddress(address) {
   const match = address?.match(/\b\d{6}\b/);
@@ -106,21 +145,30 @@ function extractPincodeFromAddress(address) {
 
 export const addMember = async (c) => {
   try {
-    // 1. Extract primary user's mobile, new member's name, and new member's mobile
+    // 1. Extract homeId, primary user's mobile, new member's name, and new member's mobile
     const body = await c.req.json();
-    const { myMobile, newName, newMobile } = body;
+    const { homeId, myMobile, newName, newMobile } = body;
 
     // 2. Validate required inputs
-    if (!myMobile || !newMobile || !newName) {
+    if (!homeId || !myMobile || !newMobile || !newName) {
       return c.json({
         success: false,
-        message: "Missing fields! myMobile, newName, and newMobile are required."
+        message: "Missing fields! homeId, myMobile, newName, and newMobile are required."
       }, 400);
     }
 
+    const cleanHomeId = homeId.trim();
     const cleanMyMobile = myMobile.trim();
     const cleanNewMobile = newMobile.trim();
     const cleanNewName = newName.trim();
+
+    // Validate MongoDB ObjectId format
+    if (!ObjectId.isValid(cleanHomeId)) {
+      return c.json({
+        success: false,
+        message: "Invalid homeId format."
+      }, 400);
+    }
 
     // Prevent adding the same number to itself
     if (cleanMyMobile === cleanNewMobile) {
@@ -134,16 +182,18 @@ export const addMember = async (c) => {
     const result = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection("Home");
 
-      // Check if the new member is already part of the household to avoid duplicate entries
-      const existingHousehold = await collection.findOne({
+      // Find the SPECIFIC home document by _id where the primary user is a member
+      const targetHome = await collection.findOne({
+        _id: new ObjectId(cleanHomeId),
         "members.mobile": cleanMyMobile
       });
 
-      if (!existingHousehold) {
+      if (!targetHome) {
         return { status: "NOT_FOUND" };
       }
 
-      const isAlreadyMember = existingHousehold.members.some(
+      // Check if the new member is already in THIS specific household
+      const isAlreadyMember = targetHome.members.some(
         (member) => member.mobile === cleanNewMobile
       );
 
@@ -151,9 +201,9 @@ export const addMember = async (c) => {
         return { status: "ALREADY_EXISTS" };
       }
 
-      // Add the new member object { name, mobile } to the members array
+      // Add the new member object { name, mobile } to the members array of this home
       const updateResult = await collection.updateOne(
-        { _id: existingHousehold._id },
+        { _id: targetHome._id },
         {
           $push: {
             members: {
@@ -172,21 +222,21 @@ export const addMember = async (c) => {
     if (result.status === "NOT_FOUND") {
       return c.json({
         success: false,
-        message: "No home record found associated with your mobile number."
+        message: "Home record not found or you do not have permission to modify this home."
       }, 404);
     }
 
     if (result.status === "ALREADY_EXISTS") {
       return c.json({
         success: false,
-        message: "This mobile number is already added as a member in your household."
+        message: "This mobile number is already added as a member in this household."
       }, 400);
     }
 
     // 5. Return success response
     return c.json({
       success: true,
-      message: `${cleanNewName} added successfully! They can now access all shared appliances.`
+      message: `${cleanNewName} added successfully! They can now access all shared appliances in this home.`
     }, 200);
 
   } catch (error) {
@@ -199,35 +249,69 @@ export const addMember = async (c) => {
   }
 };
 
+const API_KEYS = [
+  process.env.KEY_1,
+  process.env.KEY_2,
+  process.env.KEY_3,
+  process.env.KEY_4,
+  process.env.KEY_5,
+].filter(Boolean);
+
+let currentKeyIndex = 0;
+
 export const AIassist = async (c) => {
   try {
-    // Parse the JSON request body in Hono
     const { imageBase64, mimeType = "image/jpeg" } = await c.req.json();
 
     if (!imageBase64) {
+      return c.json({ success: false, message: "No imageBase64 provided" }, 400);
+    }
+
+    let responseText;
+    let attempts = 0;
+
+    // Loop at most as many times as we have keys
+    while (attempts < API_KEYS.length) {
+      const apiKey = API_KEYS[currentKeyIndex];
+
+      try {
+        const ai = new GoogleGenAI({ apiKey });
+
+        const response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: [
+            {
+              inlineData: {
+                mimeType: mimeType,
+                data: imageBase64,
+              },
+            },
+            "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}",
+          ],
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        responseText = response.text;
+        break; // Success! Keep currentKeyIndex on this working key for future calls
+      } catch (err) {
+        console.warn(`Key at index ${currentKeyIndex} failed. Rotating to next key...`);
+        attempts++;
+        // Rotate to next key index (0 -> 1 -> 0 ...)
+        currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
+      }
+    }
+
+    // If we looped through ALL keys and none worked, stop here
+    if (!responseText) {
       return c.json(
-        { success: false, message: "No imageBase64 provided" },
-        400
+        { success: false, message: "All API keys are exhausted." },
+        429
       );
     }
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        {
-          inlineData: {
-            mimeType: mimeType,
-            data: imageBase64,
-          },
-        },
-        "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}",
-      ],
-      config: {
-        responseMimeType: "application/json",
-      },
-    });
-
-    const parsedResult = JSON.parse(response.text);
+    const parsedResult = JSON.parse(responseText);
 
     return c.json({
       success: true,
