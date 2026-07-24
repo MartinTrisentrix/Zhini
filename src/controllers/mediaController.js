@@ -32,12 +32,9 @@ export const uploadMedia = async (c) => {
       { 'Content-Type': file.type || 'image/jpeg' }
     );
 
-    // 5. Construct the public URL
-    const host = process.env.MINIO_ENDPOINT || 'localhost';
-    const port = process.env.MINIO_PORT ? `:${process.env.MINIO_PORT}` : '';
-    const protocol = process.env.MINIO_USE_SSL === 'true' ? 'https' : 'http';
-
-    const publicUrl = `${protocol}://${host}${port}/${BUCKET_NAME}/${uniqueFileName}`;
+    // 5. Construct the public URL using MINIO_PUBLIC_URL (e.g., http://192.168.1.X:9000)
+    const baseUrl = process.env.MINIO_PUBLIC_URL || 'http://localhost:9000';
+    const publicUrl = `${baseUrl}/${BUCKET_NAME}/${uniqueFileName}`;
 
     // 6. Send the URL directly back to mobile
     return c.json({
