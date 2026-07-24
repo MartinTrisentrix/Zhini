@@ -249,15 +249,22 @@ export const addMember = async (c) => {
   }
 };
 
-const API_KEYS = [
-  process.env.KEY_1,
-  process.env.KEY_2,
-  process.env.KEY_3,
-  process.env.KEY_4,
-  process.env.KEY_5,
+const Z_AI_KEYS = [
+  process.env.Z_KEY_1,
+  process.env.Z_KEY_2,
+  process.env.Z_KEY_3,
 ].filter(Boolean);
 
-let currentKeyIndex = 0;
+// 2. Gemini Key Array
+const GEMINI_KEYS = [
+  process.env.KEY_1,
+  process.env.KEY_2,
+  process.env.KEY_3
+  
+].filter(Boolean);
+
+let currentZKeyIndex = 0;
+let currentGeminiKeyIndex = 0;
 
 export const AIassist = async (c) => {
   try {
@@ -267,58 +274,139 @@ export const AIassist = async (c) => {
       return c.json({ success: false, message: "No imageBase64 provided" }, 400);
     }
 
+    const promptText =
+      "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}";
+
     let responseText;
-    let attempts = 0;
 
-    // Loop at most as many times as we have keys
-    while (attempts < API_KEYS.length) {
-      const apiKey = API_KEYS[currentKeyIndex];
+    // ==========================================
+    // 1. PRIMARY: Try Z AI with Key Rotation + Model Fallback
+    // ==========================================
+    if (Z_AI_KEYS.length > 0) {
+      const zaiVisionModels = ["glm-4.6v-flash", "glm-4.5v", "glm-4.6v"]; // Best → Good → Stronger
+      let zAttempts = 0;
 
-      try {
-        const ai = new GoogleGenAI({ apiKey });
+      while (zAttempts < Z_AI_KEYS.length * zaiVisionModels.length) {
+        const zApiKey = Z_AI_KEYS[currentZKeyIndex];
+        const currentModel = zaiVisionModels[zAttempts % zaiVisionModels.length];
 
-        const response = await ai.models.generateContent({
-          model: "gemini-2.5-flash",
-          contents: [
-            {
-              inlineData: {
-                mimeType: mimeType,
-                data: imageBase64,
-              },
+        try {
+          console.log(`Attempting Z AI → Key ${currentZKeyIndex} | Model: ${currentModel}`);
+
+          const zAiResponse = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${zApiKey}`,
             },
-            "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}",
-          ],
-          config: {
-            responseMimeType: "application/json",
-          },
-        });
+            body: JSON.stringify({
+              model: currentModel,
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "image_url",
+                      image_url: {
+                        url: `data:${mimeType};base64,${imageBase64}`,
+                      },
+                    },
+                    {
+                      type: "text",
+                      text: promptText,
+                    },
+                  ],
+                },
+              ],
+              response_format: { type: "json_object" },
+              max_tokens: 300,
+              temperature: 0.1,
+            }),
+          });
 
-        responseText = response.text;
-        break; // Success! Keep currentKeyIndex on this working key for future calls
-      } catch (err) {
-        console.warn(`Key at index ${currentKeyIndex} failed. Rotating to next key...`);
-        attempts++;
-        // Rotate to next key index (0 -> 1 -> 0 ...)
-        currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
+          if (zAiResponse.ok) {
+            const zAiData = await zAiResponse.json();
+            responseText = zAiData.choices?.[0]?.message?.content;
+            console.log(`✅ Z AI Success! (Model: ${currentModel})`);
+            break;
+          } else {
+            const errData = await zAiResponse.text();
+            console.warn(`Z AI failed → Key ${currentZKeyIndex} | Model ${currentModel} | ${zAiResponse.status}: ${errData}`);
+            
+            // Rotate key after trying all models for current key
+            if ((zAttempts + 1) % zaiVisionModels.length === 0) {
+              currentZKeyIndex = (currentZKeyIndex + 1) % Z_AI_KEYS.length;
+            }
+            zAttempts++;
+          }
+        } catch (zAiErr) {
+          console.warn(`Z AI error → Key ${currentZKeyIndex}:`, zAiErr.message);
+          zAttempts++;
+          if (zAttempts % zaiVisionModels.length === 0) {
+            currentZKeyIndex = (currentZKeyIndex + 1) % Z_AI_KEYS.length;
+          }
+        }
       }
     }
 
-    // If we looped through ALL keys and none worked, stop here
+    // ==========================================
+    // 2. FALLBACK: Gemini
+    // ==========================================
+    if (!responseText && GEMINI_KEYS.length > 0) {
+      console.log("Z AI unavailable. Falling back to Gemini...");
+      let geminiAttempts = 0;
+
+      while (geminiAttempts < GEMINI_KEYS.length) {
+        const apiKey = GEMINI_KEYS[currentGeminiKeyIndex];
+
+        try {
+          const ai = new GoogleGenAI({ apiKey });
+
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",   // or "gemini-1.5-flash" if needed
+            contents: [
+              {
+                inlineData: {
+                  mimeType: mimeType,
+                  data: imageBase64,
+                },
+              },
+              promptText,
+            ],
+            config: {
+              responseMimeType: "application/json",
+            },
+          });
+
+          responseText = response.text;
+          console.log("✅ Gemini execution successful!");
+          break;
+        } catch (err) {
+          console.warn(`Gemini key ${currentGeminiKeyIndex} failed. Rotating...`);
+          geminiAttempts++;
+          currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % GEMINI_KEYS.length;
+        }
+      }
+    }
+
+    // Final fallback if everything fails
     if (!responseText) {
       return c.json(
-        { success: false, message: "All API keys are exhausted." },
+        { success: false, message: "All AI services and API keys are exhausted." },
         429
       );
     }
 
-    const parsedResult = JSON.parse(responseText);
+    // Clean and parse JSON
+    const cleanedText = responseText.replace(/```json|```/g, "").trim();
+    const parsedResult = JSON.parse(cleanedText);
 
     return c.json({
       success: true,
       data: parsedResult,
     });
   } catch (error) {
-    console.error("Gemini Vision Error:", error.message);
+    console.error("AI Assist Error:", error.message);
     return c.json(
       { success: false, message: "Failed to identify product from image" },
       500
