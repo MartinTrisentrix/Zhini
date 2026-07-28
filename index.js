@@ -9,13 +9,13 @@ import { initMinioBucket } from './src/services/minioClient.js';
 
 import productRouter from './src/routes/productRoutes.js';
 import serviceRouter from './src/routes/serviceRoutes.js';
-import mediaRouter from './src/routes/mediaRoutes.js';
+
 
 
 app.use('*', cors());
 
 app.route('/product', productRouter);
-app.route('/media', mediaRouter);
+
 app.route('/service', serviceRouter);
 
 

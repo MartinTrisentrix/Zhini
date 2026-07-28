@@ -1,6 +1,9 @@
 import { withDatabase } from '../utils/config.js';
 import { ObjectId } from "mongodb";
 import { GoogleGenAI, Type } from "@google/genai";
+import { minioClient, BUCKET_NAME } from '../services/minioClient.js';
+import path from 'path';
+import crypto from 'crypto';
 
 
 
@@ -10,13 +13,47 @@ const mongoUri = process.env.MONGODB_URI;
 
 export const createProductSubmission = async (c) => {
   try {
-    const { homeId, name, mobile, address, roomName, product, brand, warranty } = await c.req.json();
+    // 1. Parse multipart/form-data request
+    const body = await c.req.parseBody();
 
-    // Mobile, product, and brand are mandatory for both flows
+    const homeId = body.homeId;
+    const name = body.name;
+    const mobile = body.mobile;
+    const address = body.address;
+    const roomName = body.roomName;
+    const product = body.product;
+    const brand = body.brand;
+    const warranty = body.warranty;
+    const file = body.file; // File object or undefined
+
+    // Mobile, product, and brand validation
     if (!mobile || !product || !brand) {
       return c.json({ success: false, message: "Missing required fields (mobile, product, brand)." }, 400);
     }
 
+    // 2. Handle MinIO Image Upload (if file provided)
+    let imageUrl = null;
+
+    if (file && typeof file !== 'string' && file.name) {
+      const fileExtension = path.extname(file.name) || '.jpg';
+      const uniqueFileName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${fileExtension}`;
+
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      await minioClient.putObject(
+        BUCKET_NAME,
+        uniqueFileName,
+        buffer,
+        buffer.length,
+        { 'Content-Type': file.type || 'image/jpeg' }
+      );
+
+      const baseUrl = process.env.MINIO_PUBLIC_URL || 'http://localhost:9000';
+      imageUrl = `${baseUrl}/${BUCKET_NAME}/${uniqueFileName}`;
+    }
+
+    // 3. Construct clean Product object
     const cleanMobile = mobile.trim();
     const cleanName = (name || "Member").trim();
     const normalizedRoom = (roomName || "hall").trim().toLowerCase();
@@ -25,15 +62,15 @@ export const createProductSubmission = async (c) => {
       product: product.trim(),
       brand: brand.trim(),
       warranty: warranty || null,
+      imageUrl: imageUrl, // Stored MinIO URL or null
       createdAt: new Date().toISOString()
     };
 
+    // 4. Update or Insert into MongoDB
     const result = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection("Home");
 
-      // =======================================================================
-      // BRANCH 1: ADD PRODUCT TO AN EXISTING HOME (homeId is provided)
-      // =======================================================================
+      // BRANCH 1: ADD PRODUCT TO EXISTING HOME
       if (homeId) {
         if (!ObjectId.isValid(homeId)) {
           throw new Error("INVALID_HOME_ID");
@@ -45,7 +82,6 @@ export const createProductSubmission = async (c) => {
           throw new Error("HOME_NOT_FOUND");
         }
 
-        // Push product into the dynamic room of the targeted home
         return await collection.findOneAndUpdate(
           { _id: new ObjectId(homeId) },
           {
@@ -56,9 +92,7 @@ export const createProductSubmission = async (c) => {
         );
       }
 
-      // =======================================================================
-      // BRANCH 2: CREATE A BRAND NEW HOME RECORD (homeId is missing/null)
-      // =======================================================================
+      // BRANCH 2: CREATE BRAND NEW HOME RECORD
       if (!address) {
         throw new Error("MISSING_ADDRESS");
       }
@@ -83,7 +117,6 @@ export const createProductSubmission = async (c) => {
   } catch (error) {
     console.error("❌ Controller Error:", error);
 
-    // Specific error handling for the Database block
     if (error.message === "INVALID_HOME_ID") {
       return c.json({ success: false, message: "Invalid homeId format provided." }, 400);
     }
@@ -249,21 +282,59 @@ export const addMember = async (c) => {
   }
 };
 
-const Z_AI_KEYS = [
-  process.env.Z_KEY_1,
-  process.env.Z_KEY_2,
-  process.env.Z_KEY_3,
-].filter(Boolean);
+export const deleteMember = async (c) => {
+  const homeId = c.req.param('homeId');
+  const { mobile } = await c.req.json(); // Identify member by mobile number
 
-// 2. Gemini Key Array
+  const result = await withDatabase(mongoUri, async (db) => {
+    return await db.collection('Home').updateOne(
+      { _id: new ObjectId(homeId) },
+      { 
+        $pull: { 
+          members: { mobile: mobile } // Pulls out the member matching this mobile
+        },
+        $set: { updatedAt: new Date().toISOString() }
+      }
+    );
+  });
+
+  if (result.modifiedCount === 0) {
+    return c.json({ success: false, message: 'Home or member not found' }, 404);
+  }
+
+  return c.json({ success: true, message: 'Member deleted successfully' });
+};
+
+export const deleteRoomProduct = async (c) => {
+  const homeId = c.req.param('homeId');
+  const { roomName, product } = await c.req.json(); // e.g., roomName: "kitchen", product: "Laptop"
+
+  const result = await withDatabase(mongoUri, async (db) => {
+    return await db.collection('Home').updateOne(
+      { _id: new ObjectId(homeId) },
+      { 
+        $pull: { 
+          [`rooms.${roomName}`]: { product: product } // Dynamic key for room (e.g., rooms.kitchen)
+        },
+        $set: { updatedAt: new Date().toISOString() }
+      }
+    );
+  });
+
+  if (result.modifiedCount === 0) {
+    return c.json({ success: false, message: 'Home, room, or product not found' }, 404);
+  }
+
+  return c.json({ success: true, message: 'Product deleted successfully' });
+};
+
+
 const GEMINI_KEYS = [
   process.env.KEY_1,
   process.env.KEY_2,
-  process.env.KEY_3
-  
+  process.env.KEY_3,
 ].filter(Boolean);
 
-let currentZKeyIndex = 0;
 let currentGeminiKeyIndex = 0;
 
 export const AIassist = async (c) => {
@@ -274,130 +345,59 @@ export const AIassist = async (c) => {
       return c.json({ success: false, message: "No imageBase64 provided" }, 400);
     }
 
+    if (GEMINI_KEYS.length === 0) {
+      return c.json({ success: false, message: "No API keys configured" }, 500);
+    }
+
     const promptText =
       "Identify the appliance in this image. Return ONLY a raw JSON object with exactly two keys: 'brand' and 'product'. Example: {\"brand\": \"Samsung\", \"product\": \"Washing Machine\"}";
 
     let responseText;
+    let geminiAttempts = 0;
 
-    // ==========================================
-    // 1. PRIMARY: Try Z AI with Key Rotation + Model Fallback
-    // ==========================================
-    if (Z_AI_KEYS.length > 0) {
-      const zaiVisionModels = ["glm-4.6v-flash", "glm-4.5v", "glm-4.6v"]; // Best → Good → Stronger
-      let zAttempts = 0;
+    // Cycle through available Gemini API keys on failure
+    while (geminiAttempts < GEMINI_KEYS.length) {
+      const apiKey = GEMINI_KEYS[currentGeminiKeyIndex];
 
-      while (zAttempts < Z_AI_KEYS.length * zaiVisionModels.length) {
-        const zApiKey = Z_AI_KEYS[currentZKeyIndex];
-        const currentModel = zaiVisionModels[zAttempts % zaiVisionModels.length];
+      try {
+        console.log(`🤖 Attempting Gemini execution with Key index: ${currentGeminiKeyIndex}`);
+        const ai = new GoogleGenAI({ apiKey });
 
-        try {
-          console.log(`Attempting Z AI → Key ${currentZKeyIndex} | Model: ${currentModel}`);
-
-          const zAiResponse = await fetch("https://api.z.ai/api/paas/v4/chat/completions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${zApiKey}`,
-            },
-            body: JSON.stringify({
-              model: currentModel,
-              messages: [
-                {
-                  role: "user",
-                  content: [
-                    {
-                      type: "image_url",
-                      image_url: {
-                        url: `data:${mimeType};base64,${imageBase64}`,
-                      },
-                    },
-                    {
-                      type: "text",
-                      text: promptText,
-                    },
-                  ],
-                },
-              ],
-              response_format: { type: "json_object" },
-              max_tokens: 300,
-              temperature: 0.1,
-            }),
-          });
-
-          if (zAiResponse.ok) {
-            const zAiData = await zAiResponse.json();
-            responseText = zAiData.choices?.[0]?.message?.content;
-            console.log(`✅ Z AI Success! (Model: ${currentModel})`);
-            break;
-          } else {
-            const errData = await zAiResponse.text();
-            console.warn(`Z AI failed → Key ${currentZKeyIndex} | Model ${currentModel} | ${zAiResponse.status}: ${errData}`);
-            
-            // Rotate key after trying all models for current key
-            if ((zAttempts + 1) % zaiVisionModels.length === 0) {
-              currentZKeyIndex = (currentZKeyIndex + 1) % Z_AI_KEYS.length;
-            }
-            zAttempts++;
-          }
-        } catch (zAiErr) {
-          console.warn(`Z AI error → Key ${currentZKeyIndex}:`, zAiErr.message);
-          zAttempts++;
-          if (zAttempts % zaiVisionModels.length === 0) {
-            currentZKeyIndex = (currentZKeyIndex + 1) % Z_AI_KEYS.length;
-          }
-        }
-      }
-    }
-
-    // ==========================================
-    // 2. FALLBACK: Gemini
-    // ==========================================
-    if (!responseText && GEMINI_KEYS.length > 0) {
-      console.log("Z AI unavailable. Falling back to Gemini...");
-      let geminiAttempts = 0;
-
-      while (geminiAttempts < GEMINI_KEYS.length) {
-        const apiKey = GEMINI_KEYS[currentGeminiKeyIndex];
-
-        try {
-          const ai = new GoogleGenAI({ apiKey });
-
-          const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",   // or "gemini-1.5-flash" if needed
-            contents: [
-              {
-                inlineData: {
-                  mimeType: mimeType,
-                  data: imageBase64,
-                },
+        const response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: [
+            {
+              inlineData: {
+                mimeType: mimeType,
+                data: imageBase64,
               },
-              promptText,
-            ],
-            config: {
-              responseMimeType: "application/json",
             },
-          });
+            promptText, // Text prompt passed alongside inlineData
+          ],
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
 
-          responseText = response.text;
-          console.log("✅ Gemini execution successful!");
-          break;
-        } catch (err) {
-          console.warn(`Gemini key ${currentGeminiKeyIndex} failed. Rotating...`);
-          geminiAttempts++;
-          currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % GEMINI_KEYS.length;
-        }
+        responseText = response.text;
+        console.log("✅ Gemini execution successful!");
+        break; // Exit loop on success
+      } catch (err) {
+        console.warn(`⚠️ Gemini key index ${currentGeminiKeyIndex} failed: ${err.message}. Rotating key...`);
+        geminiAttempts++;
+        currentGeminiKeyIndex = (currentGeminiKeyIndex + 1) % GEMINI_KEYS.length;
       }
     }
 
-    // Final fallback if everything fails
+    // Exhausted all key attempts
     if (!responseText) {
       return c.json(
-        { success: false, message: "All AI services and API keys are exhausted." },
+        { success: false, message: "All Gemini API keys failed or quota exceeded." },
         429
       );
     }
 
-    // Clean and parse JSON
+    // Safely parse JSON response
     const cleanedText = responseText.replace(/```json|```/g, "").trim();
     const parsedResult = JSON.parse(cleanedText);
 
@@ -406,9 +406,9 @@ export const AIassist = async (c) => {
       data: parsedResult,
     });
   } catch (error) {
-    console.error("AI Assist Error:", error.message);
+    console.error("❌ AI Assist Error:", error.message);
     return c.json(
-      { success: false, message: "Failed to identify product from image" },
+      { success: false, message: "Failed to identify product from image", error: error.message },
       500
     );
   }
