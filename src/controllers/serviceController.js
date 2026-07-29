@@ -1,6 +1,7 @@
 import { withDatabase } from '../utils/config.js';
 import { scrapeServiceCenters,scrapeHomeServices } from '../services/scrapeService.js';
 import 'dotenv/config';
+import {minioClient} from '../services/minioClient.js';
 
 const mongoUri = process.env.MONGODB_URI;
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
@@ -230,6 +231,134 @@ export const getNearbyHomeServices = async (c) => {
   } catch (error) {
     console.error("❌ Home Services Controller Error:", error);
     return c.json({ success: false, message: "Internal Server Error", error: error.message }, 500);
+  }
+};
+
+
+//Service Provider Part//
+
+export const createServiceProvider = async (c) => {
+  try {
+    const body = await c.req.parseBody();
+
+    // 1. Extract and validate mandatory fields
+    const name = body["name"];
+    const mobile = body["mobile"];
+    const range = body["range"];
+    const expertiseInput = body["expertise"];
+    const gstNumber = body["gstNumber"] || null; // Optional
+
+    if (!name || !mobile || !range || !expertiseInput) {
+      return c.json({
+        success: false,
+        message: "Missing required fields: name, mobile, range, or expertise."
+      }, 400);
+    }
+
+    // 2. Format expertise (handles comma-separated string or array)
+    let expertise = [];
+    if (typeof expertiseInput === "string") {
+      expertise = expertiseInput.split(",").map((e) => e.trim()).filter(Boolean);
+    } else if (Array.isArray(expertiseInput)) {
+      expertise = expertiseInput.map((e) => String(e).trim());
+    }
+
+    // 3. Handle optional shop photo upload to MinIO
+    let shopImageUrl = null;
+    const photoFile = body["photo"]; // Form-data field name: 'photo'
+
+    if (photoFile && photoFile instanceof File) {
+      const fileExtension = photoFile.name.split(".").pop() || "jpg";
+      const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.${fileExtension}`;
+
+      const arrayBuffer = await photoFile.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      await minioClient.putObject(
+        "app-images",
+        fileName,
+        buffer,
+        buffer.length,
+        { "Content-Type": photoFile.type || "image/jpeg" }
+      );
+
+      const baseUrl = process.env.MINIO_PUBLIC_URL || "http://192.168.0.7:9000";
+      shopImageUrl = `${baseUrl}/app-images/${fileName}`;
+    }
+
+    // 4. Construct document payload
+    const newProvider = {
+      name: name.trim(),
+      mobile: mobile.trim(),
+      expertise,
+      serviceRadiusKm: Number(range) || range,
+      gstNumber: gstNumber ? gstNumber.trim() : null,
+      shopImageUrl,
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    // 5. Query database using withDatabase wrapper
+    const result = await withDatabase(mongoUri, async (db) => {
+      const collection = db.collection("Service-Providers");
+      return await collection.insertOne(newProvider);
+    });
+
+    // 6. Return success response
+    return c.json({
+      success: true,
+      message: "Service Provider created successfully.",
+      data: {
+        _id: result.insertedId,
+        ...newProvider
+      }
+    }, 201);
+
+  } catch (error) {
+    console.error("❌ Create Service Provider Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Internal Server Error",
+      error: error.message
+    }, 500);
+  }
+};
+
+
+export const getAllServiceProviders = async (c) => {
+  try {
+    // 1. Query database using withDatabase wrapper
+    const providers = await withDatabase(mongoUri, async (db) => {
+      const collection = db.collection("Service-Providers");
+      return await collection.find({}).sort({ createdAt: -1 }).toArray();
+    });
+
+    // 2. Handle case where no providers exist
+    if (!providers || providers.length === 0) {
+      return c.json({
+        success: true,
+        message: "No service providers found.",
+        count: 0,
+        data: []
+      }, 200);
+    }
+
+    // 3. Return success response
+    return c.json({
+      success: true,
+      message: `Successfully retrieved ${providers.length} service provider(s).`,
+      count: providers.length,
+      data: providers
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Get All Service Providers Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Internal Server Error",
+      error: error.message
+    }, 500);
   }
 };
 
