@@ -247,8 +247,9 @@ export const createServiceProvider = async (c) => {
     const range = body["range"];
     const expertiseInput = body["expertise"];
     const gstNumber = body["gstNumber"] || null; // Optional
+    const address = body["address"];// Optional
 
-    if (!name || !mobile || !range || !expertiseInput) {
+    if (!name || !mobile || !range || !expertiseInput|| !address) {
       return c.json({
         success: false,
         message: "Missing required fields: name, mobile, range, or expertise."
@@ -295,6 +296,7 @@ export const createServiceProvider = async (c) => {
       gstNumber: gstNumber ? gstNumber.trim() : null,
       shopImageUrl,
       status: "active",
+      address: address.trim(),
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -326,34 +328,49 @@ export const createServiceProvider = async (c) => {
 };
 
 
-export const getAllServiceProviders = async (c) => {
+export const getServiceProviderByMobile = async (c) => {
   try {
-    // 1. Query database using withDatabase wrapper
-    const providers = await withDatabase(mongoUri, async (db) => {
-      const collection = db.collection("Service-Providers");
-      return await collection.find({}).sort({ createdAt: -1 }).toArray();
-    });
+    // 1. Extract mobile number from query params
+    const mobile = c.req.query("mobile");
 
-    // 2. Handle case where no providers exist
-    if (!providers || providers.length === 0) {
+    // 2. Validate input
+    if (!mobile) {
       return c.json({
-        success: true,
-        message: "No service providers found.",
-        count: 0,
-        data: []
-      }, 200);
+        success: false,
+        message: "Mobile number is required as a query parameter."
+      }, 400);
     }
 
-    // 3. Return success response
+    const cleanMobile = mobile.trim();
+
+    // 3. Query database using withDatabase wrapper
+    const providers = await withDatabase(mongoUri, async (db) => {
+      const collection = db.collection("Service-Providers");
+      
+      // Find all matching service provider profiles for this mobile
+      return await collection.find({ mobile: cleanMobile }).toArray();
+    });
+
+    // 4. Handle case where no record is found
+    if (!providers || providers.length === 0) {
+      return c.json({
+        success: false,
+        message: "No service provider profile found for this mobile number.",
+        count: 0,
+        data: []
+      }, 404);
+    }
+
+    // 5. Return success response
     return c.json({
       success: true,
-      message: `Successfully retrieved ${providers.length} service provider(s).`,
+      message: `Successfully retrieved ${providers.length} service provider record(s).`,
       count: providers.length,
       data: providers
     }, 200);
 
   } catch (error) {
-    console.error("❌ Get All Service Providers Controller Error:", error);
+    console.error("❌ Get Service Provider Controller Error:", error);
     return c.json({
       success: false,
       message: "Internal Server Error",
@@ -361,5 +378,8 @@ export const getAllServiceProviders = async (c) => {
     }, 500);
   }
 };
+
+
+
 
 
