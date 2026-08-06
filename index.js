@@ -1,12 +1,13 @@
+import 'dotenv/config';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { serve } from '@hono/node-server';
-import 'dotenv/config';
+
+
 
 const app = new Hono();
 
 import { initMinioBucket } from './src/services/minioClient.js';
-
 import productRouter from './src/routes/productRoutes.js';
 import serviceRouter from './src/routes/serviceRoutes.js';
 
@@ -32,3 +33,10 @@ serve({
 }, (info) => {
   console.log(`🚀 ZHINI Backend Live: http://localhost:${info.port}`);
 });
+
+
+// Test endpoint inside index.js
+
+
+
+

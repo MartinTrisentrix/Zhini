@@ -1,22 +1,38 @@
 import { withDatabase } from '../utils/config.js';
-import { scrapeServiceCenters,scrapeHomeServices } from '../services/scrapeService.js';
+import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
 import 'dotenv/config';
-import {minioClient} from '../services/minioClient.js';
+import { minioClient } from '../services/minioClient.js';
+import { createProviderBoard, createServiceCard } from '../services/wekan.js';
 
 const mongoUri = process.env.MONGODB_URI;
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
 
+
+
+
 export const getNearbyService = async (c) => {
   try {
-    const rawBrand = c.req.query('brand') || '';
-    const rawProduct = c.req.query('product') || '';
-    const rawPincode = c.req.query('pincode') || '';
-    const isUnderWarranty = c.req.query('isUnderWarranty') === 'true' || c.req.query('inWarranty') === 'true';
+    // 1. Read request body (for JSON payloads) with fallback to query params
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      // Body was empty or not JSON; fall back to query params
+    }
+
+    const rawBrand = body.brand || c.req.query('brand') || '';
+    const rawProduct = body.product || c.req.query('product') || '';
+    const rawPincode = body.pincode || c.req.query('pincode') || '';
+
+    const isUnderWarranty = body.isUnderWarranty === true ||
+      body.inWarranty === true ||
+      c.req.query('isUnderWarranty') === 'true' ||
+      c.req.query('inWarranty') === 'true';
 
     // Helper to sanitize inputs
     const cleanValue = (val) => {
       if (!val) return '';
-      const sanitized = val.trim();
+      const sanitized = String(val).trim();
       const upper = sanitized.toUpperCase();
       if (upper === 'N/A' || upper === 'UNDEFINED' || upper === 'NULL') return '';
       return sanitized;
@@ -28,9 +44,9 @@ export const getNearbyService = async (c) => {
 
     if (!pincode || (!brand && !product)) {
       console.warn(`⚠️ Validation Failed [400]: brand="${rawBrand}", product="${rawProduct}", pincode="${rawPincode}"`);
-      return c.json({ 
-        success: false, 
-        message: 'pincode and at least one search term (brand or product) are required' 
+      return c.json({
+        success: false,
+        message: 'pincode and at least one search term (brand or product) are required'
       }, 400);
     }
 
@@ -51,7 +67,7 @@ export const getNearbyService = async (c) => {
         }
 
         const centers = await scrapeServiceCenters(brand, product, pincode, { authorizedOnly: true });
-        
+
         if (centers.length > 0) {
           await cacheCollection.updateOne(
             { key: cacheKey },
@@ -64,63 +80,48 @@ export const getNearbyService = async (c) => {
       }
 
       // -------------------------------------------------------------
-      // TIER 2: OUT OF WARRANTY -> Safely Check Neighbor Service History
+      // TIER 2: OUT OF WARRANTY -> Local Zhini Service Providers (By Pincode)
       // -------------------------------------------------------------
-      console.log(`🔍 Checking Tier 2: Neighbor service history for ${product} in ${pincode}`);
-      let neighborHistory = [];
+      console.log(`🔍 Checking Tier 2: Zhini Local Providers in pincode="${pincode}"`);
 
       try {
-        const historyCollection = db.collection('service_history');
+        // Updated collection name to match createServiceProvider ("Service-Providers")
+        const providerCollection = db.collection('Service-Providers');
 
-        // Safely attempt query (returns empty array if collection doesn't exist yet)
-        neighborHistory = await historyCollection.aggregate([
-          { 
-            $match: { 
-              pincode: pincode, 
-              productCategory: { $regex: new RegExp(`^${product}$`, 'i') },
-              status: 'COMPLETED'
-            } 
-          },
-          {
-            $group: {
-              _id: "$serviceCenterId",
-              name: { $first: "$serviceCenterName" },
-              address: { $first: "$serviceCenterAddress" },
-              phone: { $first: "$serviceCenterPhone" },
-              rating: { $first: "$serviceCenterRating" },
-              timesUsed: { $sum: 1 },
-              lastServicedDate: { $max: "$completedAt" }
-            }
-          },
-          { $sort: { timesUsed: -1, lastServicedDate: -1 } }
-        ]).toArray();
+        // Match active providers strictly by pincode
+        const matchingProviders = await providerCollection.find({ 
+          pincode: pincode,
+          status: 'active'
+        }).toArray();
+
+        if (matchingProviders.length > 0) {
+          console.log(`🎯 Tier 2 Hit: Found ${matchingProviders.length} Zhini Service Provider(s) for pincode=${pincode}`);
+
+          // Map provider details exactly as structured in the database document
+          const providerList = matchingProviders.map(provider => ({
+            id: provider._id,
+            name: provider.name,
+            mobile: provider.mobile,
+            address: provider.address,
+            pincode: provider.pincode,
+            shopImageUrl: provider.shopImageUrl || null,
+            serviceRadiusKm: provider.serviceRadiusKm,
+            gstNumber: provider.gstNumber || null,
+            expertise: provider.expertise || []
+          }));
+
+          return {
+            tier: 2,
+            tierName: 'Zhini Verified Partner',
+            data: providerList
+          };
+        }
       } catch (err) {
-        // If collection doesn't exist or query fails, log soft warning and fallback to Tier 3
-        console.warn(`⚠️ Tier 2 check skipped or collection unavailable: ${err.message}`);
-        neighborHistory = [];
-      }
-
-      // If neighbor history is found, return Tier 2 results
-      if (neighborHistory && neighborHistory.length > 0) {
-        console.log(`🤝 Tier 2 Hit: Found ${neighborHistory.length} neighbor-recommended centers`);
-        
-        const tier2Data = neighborHistory.map(item => ({
-          name: item.name,
-          phone: item.phone || "N/A",
-          address: item.address || "Address not available",
-          rating: item.rating ? item.rating.toString() : "N/A",
-          neighborProof: {
-            timesUsed: item.timesUsed,
-            badge: `Used by ${item.timesUsed} neighbor${item.timesUsed > 1 ? 's' : ''} near you`,
-            lastUsed: item.lastServicedDate
-          }
-        }));
-
-        return { tier: 2, tierName: 'Neighbor Trusted', data: tier2Data };
+        console.warn(`⚠️ Tier 2 execution failed or bypassed: ${err.message}`);
       }
 
       // -------------------------------------------------------------
-      // TIER 3 (Fallback): OUT OF WARRANTY + NO HISTORY -> Top 5 General
+      // TIER 3 (Fallback): OUT OF WARRANTY + NO ZHINI PROVIDER -> Top 5 General
       // -------------------------------------------------------------
       console.log(`🏢 Tier 3 Fallback Triggered: Fetching Top 5 local centers for ${brand || product} in ${pincode}`);
       const cacheKeyTier3 = `tier3_${brand}_${product}_${pincode}`.toLowerCase().replace(/\s+/g, '');
@@ -132,8 +133,7 @@ export const getNearbyService = async (c) => {
       }
 
       const rawCenters = await scrapeServiceCenters(brand, product, pincode, { authorizedOnly: false });
-      
-      // Sort by rating (descending) and cap at Top 5
+
       const top5Centers = rawCenters
         .sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0))
         .slice(0, 5);
@@ -149,12 +149,12 @@ export const getNearbyService = async (c) => {
       return { tier: 3, tierName: 'General Top Rated', data: top5Centers };
     });
 
-    return c.json({ 
-      success: true, 
+    return c.json({
+      success: true,
       tier: response.tier,
       tierName: response.tierName,
       count: response.data.length,
-      data: response.data 
+      data: response.data
     }, 200);
 
   } catch (error) {
@@ -183,9 +183,9 @@ export const getNearbyHomeServices = async (c) => {
     // Validation: Need both pincode and serviceType (e.g., Electrician, Plumber)
     if (!pincode || !serviceType) {
       console.warn(`⚠️ Validation Failed [400]: serviceType="${rawServiceType}", pincode="${rawPincode}"`);
-      return c.json({ 
-        success: false, 
-        message: 'Both serviceType (e.g. Electrician, Plumber) and pincode are required' 
+      return c.json({
+        success: false,
+        message: 'Both serviceType (e.g. Electrician, Plumber) and pincode are required'
       }, 400);
     }
 
@@ -221,11 +221,11 @@ export const getNearbyHomeServices = async (c) => {
       return topServices;
     });
 
-    return c.json({ 
-      success: true, 
+    return c.json({
+      success: true,
       category: serviceType,
       count: servicesData.length,
-      data: servicesData 
+      data: servicesData
     }, 200);
 
   } catch (error) {
@@ -248,8 +248,9 @@ export const createServiceProvider = async (c) => {
     const expertiseInput = body["expertise"];
     const gstNumber = body["gstNumber"] || null; // Optional
     const address = body["address"];// Optional
+    const pincode = body["pincode"] || null; // Optional
 
-    if (!name || !mobile || !range || !expertiseInput|| !address) {
+    if (!name || !mobile || !range || !expertiseInput || !address) {
       return c.json({
         success: false,
         message: "Missing required fields: name, mobile, range, or expertise."
@@ -297,6 +298,7 @@ export const createServiceProvider = async (c) => {
       shopImageUrl,
       status: "active",
       address: address.trim(),
+      pincode: pincode ? pincode.trim() : null,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -327,7 +329,6 @@ export const createServiceProvider = async (c) => {
   }
 };
 
-
 export const getServiceProviderByMobile = async (c) => {
   try {
     // 1. Extract mobile number from query params
@@ -346,7 +347,7 @@ export const getServiceProviderByMobile = async (c) => {
     // 3. Query database using withDatabase wrapper
     const providers = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection("Service-Providers");
-      
+
       // Find all matching service provider profiles for this mobile
       return await collection.find({ mobile: cleanMobile }).toArray();
     });
@@ -379,6 +380,98 @@ export const getServiceProviderByMobile = async (c) => {
   }
 };
 
+
+const STATUS_TO_WEKAN_LIST = {
+  "NEW": "New",
+  "ACCEPTED": "Accepted",
+  "REJECTED": "Rejected",
+  "IN_PROGRESS": "In Progress",
+  "WAITING_FOR_PARTS": "Waiting for Parts",
+  "COMPLETED": "Completed"
+};
+
+/**
+ * PATCH Controller to update status across both Wekan and MongoDB
+ */
+export const updateTicketStatus = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {}
+
+    const { ticketId, newStatus } = body;
+
+    if (!ticketId || !newStatus) {
+      return c.json({
+        success: false,
+        message: "ticketId and newStatus are required fields."
+      }, 400);
+    }
+
+    const normalizedStatus = newStatus.toUpperCase();
+    const targetListName = STATUS_TO_WEKAN_LIST[normalizedStatus];
+
+    if (!targetListName) {
+      return c.json({
+        success: false,
+        message: `Invalid status '${newStatus}'. Allowed values: ${Object.keys(STATUS_TO_WEKAN_LIST).join(", ")}`
+      }, 400);
+    }
+
+    const updatedTicket = await withDatabase(mongoUri, async (db) => {
+      const wekanServiceCollection = db.collection('wekan-services');
+
+      // 1. Fetch existing ticket record from MongoDB
+      const ticket = await wekanServiceCollection.findOne({ ticketId });
+      if (!ticket) {
+        throw new Error(`Ticket '${ticketId}' not found in MongoDB.`);
+      }
+
+      const { boardId, cardId, listId: currentListId } = ticket.wekan;
+
+      // 2. Fetch Board structure to resolve target list ID
+      const boardResult = await createProviderBoard(ticket.assignedTo);
+      const newListId = boardResult.lists[targetListName];
+
+      if (!newListId) {
+        throw new Error(`Wekan list '${targetListName}' not found on Board '${boardId}'`);
+      }
+
+      // 3. Move Card in Wekan
+      await moveCardToList(boardId, currentListId, cardId, newListId);
+
+      // 4. Update status and current listId in MongoDB
+      const result = await wekanServiceCollection.findOneAndUpdate(
+        { ticketId },
+        {
+          $set: {
+            status: normalizedStatus,
+            "wekan.listId": newListId,
+            updatedAt: new Date()
+          }
+        },
+        { returnDocument: "after" }
+      );
+
+      return result;
+    });
+
+    return c.json({
+      success: true,
+      message: `Ticket ${ticketId} updated to '${normalizedStatus}' in MongoDB and Wekan.`,
+      data: updatedTicket
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Status Update Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to update ticket status",
+      error: error.message
+    }, 500);
+  }
+};
 
 
 
