@@ -14,6 +14,7 @@ productRouter.delete('/delete-product/:homeId', deleteRoomProduct);
 
 
 productRouter.get('/search', getSubmissionByMobile);
+
 productRouter.post('/ai', AIassist);
 
 export default productRouter;

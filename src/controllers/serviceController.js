@@ -2,7 +2,7 @@ import { withDatabase } from '../utils/config.js';
 import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
 import 'dotenv/config';
 import { minioClient } from '../services/minioClient.js';
-import { createProviderBoard, createServiceCard } from '../services/wekan.js';
+import { createServiceCard, moveCardToList, createProviderBoard } from '../services/wekan.js';
 
 const mongoUri = process.env.MONGODB_URI;
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 Hours in milliseconds
@@ -89,7 +89,7 @@ export const getNearbyService = async (c) => {
         const providerCollection = db.collection('Service-Providers');
 
         // Match active providers strictly by pincode
-        const matchingProviders = await providerCollection.find({ 
+        const matchingProviders = await providerCollection.find({
           pincode: pincode,
           status: 'active'
         }).toArray();
@@ -246,9 +246,9 @@ export const createServiceProvider = async (c) => {
     const mobile = body["mobile"];
     const range = body["range"];
     const expertiseInput = body["expertise"];
-    const gstNumber = body["gstNumber"] || null; // Optional
-    const address = body["address"];// Optional
-    const pincode = body["pincode"] || null; // Optional
+    const gstNumber = body["gstNumber"] || null;
+    const address = body["address"];
+    const pincode = body["pincode"] || null;
 
     if (!name || !mobile || !range || !expertiseInput || !address) {
       return c.json({
@@ -256,6 +256,8 @@ export const createServiceProvider = async (c) => {
         message: "Missing required fields: name, mobile, range, or expertise."
       }, 400);
     }
+
+    const cleanMobile = mobile.trim();
 
     // 2. Format expertise (handles comma-separated string or array)
     let expertise = [];
@@ -267,7 +269,7 @@ export const createServiceProvider = async (c) => {
 
     // 3. Handle optional shop photo upload to MinIO
     let shopImageUrl = null;
-    const photoFile = body["photo"]; // Form-data field name: 'photo'
+    const photoFile = body["photo"];
 
     if (photoFile && photoFile instanceof File) {
       const fileExtension = photoFile.name.split(".").pop() || "jpg";
@@ -288,10 +290,14 @@ export const createServiceProvider = async (c) => {
       shopImageUrl = `${baseUrl}/app-images/${fileName}`;
     }
 
-    // 4. Construct document payload
+    // 4. Create Wekan Board for Provider
+    console.log(`📋 Provisioning Wekan Board for Provider: ${cleanMobile}`);
+    const boardResult = await createProviderBoard(cleanMobile);
+
+    // 5. Construct document payload
     const newProvider = {
       name: name.trim(),
-      mobile: mobile.trim(),
+      mobile: cleanMobile,
       expertise,
       serviceRadiusKm: Number(range) || range,
       gstNumber: gstNumber ? gstNumber.trim() : null,
@@ -299,20 +305,21 @@ export const createServiceProvider = async (c) => {
       status: "active",
       address: address.trim(),
       pincode: pincode ? pincode.trim() : null,
+      wekanBoardId: boardResult.boardId,
+      wekanLists: boardResult.lists,
       createdAt: new Date(),
       updatedAt: new Date(),
     };
 
-    // 5. Query database using withDatabase wrapper
+    // 6. Query database using withDatabase wrapper
     const result = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection("Service-Providers");
       return await collection.insertOne(newProvider);
     });
 
-    // 6. Return success response
     return c.json({
       success: true,
-      message: "Service Provider created successfully.",
+      message: "Service Provider created successfully with Wekan board.",
       data: {
         _id: result.insertedId,
         ...newProvider
@@ -324,6 +331,160 @@ export const createServiceProvider = async (c) => {
     return c.json({
       success: false,
       message: "Internal Server Error",
+      error: error.message
+    }, 500);
+  }
+};
+
+export const createServiceTicket = async (c) => {
+  try {
+    let body = {};
+
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    const customerName = body.customerName || body.customer_name;
+    const custNumber = body.cust_number || body.customerPhone || body.mobile;
+    const address = body.address;
+    const description = body.description || body.notes || "Service Request";
+    const providerMobile = body.providerMobile;
+
+    const rawAvailableTime = body.availableTime || body.preferredTime || body.timeSlot;
+    const availableTime = rawAvailableTime ? String(rawAvailableTime).trim() : "Flexible / Not specified";
+
+    if (!customerName || !custNumber || !address || !providerMobile) {
+      return c.json({
+        success: false,
+        message: "Missing required fields: customerName, cust_number, address, and providerMobile are required.",
+      }, 400);
+    }
+
+    const ticketResult = await withDatabase(mongoUri, async (db) => {
+      const providerCollection = db.collection("Service-Providers");
+      const wekanServiceCollection = db.collection("wekan-services");
+
+      const cleanProviderMobile = providerMobile.trim();
+
+      // 1. Fetch Provider record to get board context
+      let provider = await providerCollection.findOne({ mobile: cleanProviderMobile });
+
+      let boardId = provider?.wekanBoardId;
+      let newListId = provider?.wekanLists?.["New"];
+
+      // 2. Fallback: If board or list mapping is missing, provision new board and sync back to MongoDB
+      if (!boardId || !newListId) {
+        console.warn(`⚠️ Board info missing for provider '${cleanProviderMobile}'. Provisioning now...`);
+        const boardResult = await createProviderBoard(cleanProviderMobile);
+        boardId = boardResult.boardId;
+        newListId = boardResult.lists["New"];
+
+        if (provider) {
+          await providerCollection.updateOne(
+            { mobile: cleanProviderMobile },
+            {
+              $set: {
+                wekanBoardId: boardId,
+                wekanLists: boardResult.lists,
+                updatedAt: new Date()
+              }
+            }
+          );
+        }
+      }
+
+      // 3. Format details and create card in Wekan under Customer Phone Swimlane
+      const cardTitle = `Ticket: ${customerName.trim()} (${custNumber.trim()})`;
+      const cardDescription = `Customer Name: ${customerName.trim()}\nCustomer Phone: ${custNumber.trim()}\nAddress: ${address.trim()}\nAvailable Time: ${availableTime}\nDescription: ${description.trim()}`;
+
+      const cardId = await createServiceCard(boardId, newListId, {
+        title: cardTitle,
+        description: cardDescription,
+        customerPhone: custNumber.trim(),
+      });
+
+      // 4. Save ticket document in 'wekan-services' collection
+      const ticketRecord = {
+        ticketId: `TICK-${Date.now()}`,
+        assignedTo: cleanProviderMobile,
+        customerDetails: {
+          name: customerName.trim(),
+          phone: custNumber.trim(),
+          address: address.trim(),
+        },
+        serviceDetails: {
+          description: description.trim(),
+          availableTime: availableTime,
+        },
+        wekan: {
+          boardId: boardId,
+          cardId: cardId,
+          listId: newListId,
+        },
+        status: "NEW",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      await wekanServiceCollection.insertOne(ticketRecord);
+      return ticketRecord;
+    });
+
+    return c.json({
+      success: true,
+      message: "Ticket created and assigned to service provider.",
+      data: ticketResult,
+    }, 201);
+
+  } catch (error) {
+    console.error("❌ Create Service Ticket Controller Error:", error);
+
+    return c.json({
+      success: false,
+      message: "Failed to create service ticket",
+      error: error.message,
+    }, 500);
+  }
+};
+
+
+export const getProviderTickets = async (c) => {
+  try {
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) { }
+
+    const providerMobile = body.providerMobile || c.req.query('providerMobile') || c.req.query('mobile');
+
+    if (!providerMobile) {
+      return c.json({
+        success: false,
+        message: "providerMobile query param or body field is required."
+      }, 400);
+    }
+
+    const tickets = await withDatabase(mongoUri, async (db) => {
+      const wekanServiceCollection = db.collection("wekan-services");
+      return await wekanServiceCollection
+        .find({ assignedTo: providerMobile.trim() })
+        .sort({ createdAt: -1 })
+        .toArray();
+    });
+
+    return c.json({
+      success: true,
+      count: tickets.length,
+      data: tickets
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Get Provider Tickets Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to fetch provider tickets",
       error: error.message
     }, 500);
   }
@@ -380,7 +541,6 @@ export const getServiceProviderByMobile = async (c) => {
   }
 };
 
-
 const STATUS_TO_WEKAN_LIST = {
   "NEW": "New",
   "ACCEPTED": "Accepted",
@@ -390,60 +550,67 @@ const STATUS_TO_WEKAN_LIST = {
   "COMPLETED": "Completed"
 };
 
-/**
- * PATCH Controller to update status across both Wekan and MongoDB
- */
 export const updateTicketStatus = async (c) => {
   try {
     let body = {};
     try {
       body = await c.req.json();
-    } catch (_) {}
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
 
     const { ticketId, newStatus } = body;
 
     if (!ticketId || !newStatus) {
       return c.json({
         success: false,
-        message: "ticketId and newStatus are required fields."
+        message: "Missing required fields: ticketId and newStatus are required."
       }, 400);
     }
 
-    const normalizedStatus = newStatus.toUpperCase();
+    const normalizedStatus = String(newStatus).trim().toUpperCase();
     const targetListName = STATUS_TO_WEKAN_LIST[normalizedStatus];
 
     if (!targetListName) {
       return c.json({
         success: false,
-        message: `Invalid status '${newStatus}'. Allowed values: ${Object.keys(STATUS_TO_WEKAN_LIST).join(", ")}`
+        message: `Invalid status '${newStatus}'. Allowed statuses: ${Object.keys(STATUS_TO_WEKAN_LIST).join(", ")}`
       }, 400);
     }
 
     const updatedTicket = await withDatabase(mongoUri, async (db) => {
-      const wekanServiceCollection = db.collection('wekan-services');
+      const wekanServiceCollection = db.collection("wekan-services");
+      const providerCollection = db.collection("Service-Providers");
 
-      // 1. Fetch existing ticket record from MongoDB
-      const ticket = await wekanServiceCollection.findOne({ ticketId });
+      // 1. Fetch current ticket document from MongoDB
+      const ticket = await wekanServiceCollection.findOne({ ticketId: ticketId.trim() });
       if (!ticket) {
-        throw new Error(`Ticket '${ticketId}' not found in MongoDB.`);
+        throw new Error(`Ticket '${ticketId}' not found in database.`);
       }
 
       const { boardId, cardId, listId: currentListId } = ticket.wekan;
+      const assignedProviderMobile = ticket.assignedTo;
 
-      // 2. Fetch Board structure to resolve target list ID
-      const boardResult = await createProviderBoard(ticket.assignedTo);
-      const newListId = boardResult.lists[targetListName];
+      // 2. Fetch Provider details to resolve list ID mapping
+      let provider = await providerCollection.findOne({ mobile: assignedProviderMobile });
+      let newListId = provider?.wekanLists?.[targetListName];
 
+      // Fallback: If list mapping is missing on provider doc, fetch board structure directly from Wekan
       if (!newListId) {
-        throw new Error(`Wekan list '${targetListName}' not found on Board '${boardId}'`);
+        const boardResult = await createProviderBoard(assignedProviderMobile);
+        newListId = boardResult.lists[targetListName];
       }
 
-      // 3. Move Card in Wekan
+      if (!newListId) {
+        throw new Error(`Target list '${targetListName}' could not be resolved on Wekan Board ${boardId}`);
+      }
+
+      // 3. Move card to the new list in Wekan
       await moveCardToList(boardId, currentListId, cardId, newListId);
 
-      // 4. Update status and current listId in MongoDB
-      const result = await wekanServiceCollection.findOneAndUpdate(
-        { ticketId },
+      // 4. Update status and list context in MongoDB
+      const updateResult = await wekanServiceCollection.findOneAndUpdate(
+        { ticketId: ticketId.trim() },
         {
           $set: {
             status: normalizedStatus,
@@ -454,17 +621,17 @@ export const updateTicketStatus = async (c) => {
         { returnDocument: "after" }
       );
 
-      return result;
+      return updateResult;
     });
 
     return c.json({
       success: true,
-      message: `Ticket ${ticketId} updated to '${normalizedStatus}' in MongoDB and Wekan.`,
+      message: `Ticket ${ticketId} updated to '${normalizedStatus}' successfully.`,
       data: updatedTicket
     }, 200);
 
   } catch (error) {
-    console.error("❌ Status Update Error:", error);
+    console.error("❌ Update Ticket Status Controller Error:", error);
     return c.json({
       success: false,
       message: "Failed to update ticket status",

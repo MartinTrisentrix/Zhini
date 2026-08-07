@@ -5,7 +5,6 @@ export const getWekanAuthHeaders = async () => {
   const username = process.env.WEKAN_ADMIN_USERNAME;
   const password = process.env.WEKAN_ADMIN_PASSWORD;
 
-  // Debug log to confirm values aren't undefined
   if (!username || !password) {
     throw new Error("WEKAN_ADMIN_USERNAME or WEKAN_ADMIN_PASSWORD is missing from environment variables.");
   }
@@ -36,7 +35,6 @@ export const createProviderBoard = async (mobileNumber) => {
   const baseUrl = process.env.WEKAN_BASE_URL || "http://localhost:8080";
   const headers = await getWekanAuthHeaders();
   
-  // Requirement 1: Format title as mobileNumber_year (e.g., 9876543210_2026)
   const currentYear = new Date().getFullYear();
   const boardTitle = `${mobileNumber}_${currentYear}`;
 
@@ -58,9 +56,8 @@ export const createProviderBoard = async (mobileNumber) => {
   }
 
   const boardData = await boardRes.json();
-  const boardId = boardData._id;
+  const boardId = boardData._id || boardData.id;
 
-  // Requirement 3: Added "Waiting for Parts" to required lists
   const requiredLists = [
     "New",
     "Accepted",
@@ -81,7 +78,7 @@ export const createProviderBoard = async (mobileNumber) => {
 
     if (listRes.ok) {
       const listData = await listRes.json();
-      listMap[listTitle] = listData._id;
+      listMap[listTitle] = listData._id || listData.id;
     }
   }
 
@@ -98,14 +95,10 @@ export const createServiceCard = async (boardId, listId, { title, description, c
   const headers = await getWekanAuthHeaders();
   const userId = headers["X-User-Id"];
 
-  // Fallback swimlane title if phone number isn't passed
   const swimlaneTitle = customerPhone || "General Customer";
 
   // 1. Fetch existing swimlanes for this board
-  const swimlanesRes = await fetch(`${baseUrl}/api/boards/${boardId}/swimlanes`, {
-    headers,
-  });
-
+  const swimlanesRes = await fetch(`${baseUrl}/api/boards/${boardId}/swimlanes`, { headers });
   if (!swimlanesRes.ok) {
     const errText = await swimlanesRes.text();
     throw new Error(`Failed to fetch swimlanes (${swimlanesRes.status}): ${errText}`);
@@ -114,61 +107,93 @@ export const createServiceCard = async (boardId, listId, { title, description, c
   const swimlanes = await swimlanesRes.json();
   let targetSwimlane = swimlanes.find((s) => s.title === swimlaneTitle);
 
-  // Requirement 2: Create a swimlane named after the Customer Mobile Number if it doesn't exist
+  // 2. Handle Swimlane Binding
   if (!targetSwimlane) {
-    const createSwimlaneRes = await fetch(`${baseUrl}/api/boards/${boardId}/swimlanes`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        title: swimlaneTitle,
-      }),
-    });
+    // Check if board only has Wekan's automatically created Default swimlane
+    const defaultSwimlane = swimlanes.find((s) => s.title === "Default" || s.type === "default");
 
-    if (!createSwimlaneRes.ok) {
-      const errText = await createSwimlaneRes.text();
-      throw new Error(`Failed to create swimlane (${createSwimlaneRes.status}): ${errText}`);
+    if (defaultSwimlane) {
+      // OVERWRITE the Default swimlane with Customer Number to inherit all built-in list grid cells
+      const renameRes = await fetch(`${baseUrl}/api/boards/${boardId}/swimlanes/${defaultSwimlane._id || defaultSwimlane.id}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ title: swimlaneTitle }),
+      });
+
+      if (renameRes.ok) {
+        targetSwimlane = await renameRes.json();
+      } else {
+        targetSwimlane = defaultSwimlane;
+      }
+    } else {
+      // Create additional customer swimlane row
+      const createSwimlaneRes = await fetch(`${baseUrl}/api/boards/${boardId}/swimlanes`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          title: swimlaneTitle,
+          type: "swimlane",
+        }),
+      });
+
+      if (!createSwimlaneRes.ok) {
+        const errText = await createSwimlaneRes.text();
+        throw new Error(`Failed to create swimlane (${createSwimlaneRes.status}): ${errText}`);
+      }
+
+      targetSwimlane = await createSwimlaneRes.json();
     }
-
-    targetSwimlane = await createSwimlaneRes.json();
-    console.log(`✅ Created Swimlane "${swimlaneTitle}" (ID: ${targetSwimlane._id})`);
   }
 
-  // 2. Create the Card with the Customer's Swimlane ID
+  const targetSwimlaneId = String(targetSwimlane._id || targetSwimlane.id);
+
+  // 3. Create Card explicitly tied to target swimlane
+  const payload = {
+    title,
+    description,
+    authorId: userId,
+    userId: userId,
+    swimlaneId: targetSwimlaneId,
+  };
+
   const res = await fetch(`${baseUrl}/api/boards/${boardId}/lists/${listId}/cards`, {
     method: "POST",
     headers,
-    body: JSON.stringify({
-      title,
-      description,
-      authorId: userId,
-      userId: userId,
-      swimlaneId: targetSwimlane._id,
-    }),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
     const errText = await res.text();
+    console.error(`❌ Wekan Card POST Error Details:`, errText);
     throw new Error(`Failed to create Wekan card (${res.status}): ${errText}`);
   }
 
   const card = await res.json();
-  console.log(`✅ Created Card "${title}" (ID: ${card._id}) in Swimlane "${swimlaneTitle}"`);
+  const createdCardId = card._id || card.id;
 
-  return card._id;
+  console.log(`✅ Created Card "${title}" (ID: ${createdCardId}) in Swimlane "${swimlaneTitle}"`);
+  return createdCardId;
 };
 
-export const moveCardToList = async (boardId, currentListId, cardId, newListId) => {
+// Fixed moveCardToList that retains swimlane reference on move
+export const moveCardToList = async (boardId, currentListId, cardId, newListId, swimlaneId) => {
   const baseUrl = process.env.WEKAN_BASE_URL || "http://localhost:8080";
   const headers = await getWekanAuthHeaders();
+
+  const payload = {
+    listId: newListId,
+  };
+
+  if (swimlaneId) {
+    payload.swimlaneId = swimlaneId;
+  }
 
   const res = await fetch(
     `${baseUrl}/api/boards/${boardId}/lists/${currentListId}/cards/${cardId}`,
     {
       method: "PUT",
       headers,
-      body: JSON.stringify({
-        listId: newListId,
-      }),
+      body: JSON.stringify(payload),
     }
   );
 
