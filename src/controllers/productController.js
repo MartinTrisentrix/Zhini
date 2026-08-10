@@ -1,7 +1,7 @@
 import { withDatabase } from '../utils/config.js';
 import { ObjectId } from "mongodb";
 import { GoogleGenAI, Type } from "@google/genai";
-import { minioClient, BUCKET_NAME } from '../services/minioClient.js';
+import { uploadToR2 } from "../services/r2.service.js";
 import path from 'path';
 import crypto from 'crypto';
 
@@ -31,25 +31,10 @@ export const createProductSubmission = async (c) => {
       return c.json({ success: false, message: "Missing required fields (mobile, product, brand)." }, 400);
     }
 
-    // 2. Handle MinIO Image Upload
+    // 2. Handle Cloudflare R2 Image Upload
     let imageUrl = null;
     if (file && typeof file !== 'string' && file.name) {
-      const fileExtension = path.extname(file.name) || '.jpg';
-      const uniqueFileName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${fileExtension}`;
-
-      const arrayBuffer = await file.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      await minioClient.putObject(
-        BUCKET_NAME,
-        uniqueFileName,
-        buffer,
-        buffer.length,
-        { 'Content-Type': file.type || 'image/jpeg' }
-      );
-
-      const baseUrl = process.env.MINIO_PUBLIC_URL || 'http://localhost:9000';
-      imageUrl = `${baseUrl}/${BUCKET_NAME}/${uniqueFileName}`;
+      imageUrl = await uploadToR2(file, "product-images");
     }
 
     const cleanMobile = mobile.trim();
@@ -100,7 +85,7 @@ export const createProductSubmission = async (c) => {
           throw new Error("HOME_NOT_FOUND");
         }
 
-        // Link user to home members array (supporting both 'members' and 'memberIds' schema variants)
+        // Link user to home members array
         await homesCol.updateOne(
           { _id: targetHomeId },
           {
@@ -180,7 +165,7 @@ export const createProductSubmission = async (c) => {
         product: product.trim(),
         brand: brand.trim(),
         warranty: warranty || null,
-        imageUrl: imageUrl,
+        imageUrl: imageUrl, // Stores the public R2 URL
         addedByUserId: user._id,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()

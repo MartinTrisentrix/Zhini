@@ -7,12 +7,12 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1105.0",
     "@google/genai": "^2.12.0",
     "@hono/node-server": "^1.19.14",
     "axios": "^1.18.1",
     "dotenv": "^17.4.2",
     "hono": "^4.12.9",
-    "minio": "^8.0.7",
     "mongodb": "^7.1.0",
     "multer": "^2.2.0"
   }

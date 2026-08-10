@@ -1,7 +1,8 @@
 import { withDatabase } from '../utils/config.js';
 import { scrapeServiceCenters, scrapeHomeServices } from '../services/scrapeService.js';
 import 'dotenv/config';
-import { minioClient } from '../services/minioClient.js';
+import { ObjectId } from "mongodb";
+import { uploadToR2 } from "../services/r2.service.js";
 import { createServiceCard, moveCardToList, createProviderBoard } from '../services/wekan.js';
 
 const mongoUri = process.env.MONGODB_URI;
@@ -235,13 +236,65 @@ export const getNearbyHomeServices = async (c) => {
 };
 
 
+
 //Service Provider Part//
+
+export const getServiceProviderByMobile = async (c) => {
+  try {
+    // 1. Extract mobile number from query params
+    const mobile = c.req.query("mobile");
+
+    // 2. Validate input
+    if (!mobile) {
+      return c.json({
+        success: false,
+        message: "Mobile number is required as a query parameter."
+      }, 400);
+    }
+
+    const cleanMobile = mobile.trim();
+
+    // 3. Query database using withDatabase wrapper
+    const providers = await withDatabase(mongoUri, async (db) => {
+      const collection = db.collection("Service-Providers");
+
+      // Find all matching service provider profiles for this mobile
+      return await collection.find({ mobile: cleanMobile }).toArray();
+    });
+
+    // 4. Handle case where no record is found
+    if (!providers || providers.length === 0) {
+      return c.json({
+        success: false,
+        message: "No service provider profile found for this mobile number.",
+        count: 0,
+        data: []
+      }, 404);
+    }
+
+    // 5. Return success response
+    return c.json({
+      success: true,
+      message: `Successfully retrieved ${providers.length} service provider record(s).`,
+      count: providers.length,
+      data: providers
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Get Service Provider Controller Error:", error);
+    return c.json({
+      success: false,
+      message: "Internal Server Error",
+      error: error.message
+    }, 500);
+  }
+};
+
 
 export const createServiceProvider = async (c) => {
   try {
     const body = await c.req.parseBody();
 
-    // 1. Extract and validate mandatory fields
     const name = body["name"];
     const mobile = body["mobile"];
     const range = body["range"];
@@ -259,7 +312,6 @@ export const createServiceProvider = async (c) => {
 
     const cleanMobile = mobile.trim();
 
-    // 2. Format expertise (handles comma-separated string or array)
     let expertise = [];
     if (typeof expertiseInput === "string") {
       expertise = expertiseInput.split(",").map((e) => e.trim()).filter(Boolean);
@@ -267,41 +319,25 @@ export const createServiceProvider = async (c) => {
       expertise = expertiseInput.map((e) => String(e).trim());
     }
 
-    // 3. Handle optional shop photo upload to MinIO
+    // Upload shop photo directly to Cloudflare R2
     let shopImageUrl = null;
     const photoFile = body["photo"];
 
     if (photoFile && photoFile instanceof File) {
-      const fileExtension = photoFile.name.split(".").pop() || "jpg";
-      const fileName = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}.${fileExtension}`;
-
-      const arrayBuffer = await photoFile.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      await minioClient.putObject(
-        "app-images",
-        fileName,
-        buffer,
-        buffer.length,
-        { "Content-Type": photoFile.type || "image/jpeg" }
-      );
-
-      const baseUrl = process.env.MINIO_PUBLIC_URL || "http://192.168.0.7:9000";
-      shopImageUrl = `${baseUrl}/app-images/${fileName}`;
+      shopImageUrl = await uploadToR2(photoFile, "shop-images");
     }
 
-    // 4. Create Wekan Board for Provider
+    // Provision Wekan Board
     console.log(`📋 Provisioning Wekan Board for Provider: ${cleanMobile}`);
     const boardResult = await createProviderBoard(cleanMobile);
 
-    // 5. Construct document payload
     const newProvider = {
       name: name.trim(),
       mobile: cleanMobile,
       expertise,
       serviceRadiusKm: Number(range) || range,
       gstNumber: gstNumber ? gstNumber.trim() : null,
-      shopImageUrl,
+      shopImageUrl, // Stores HTTPS R2 URL
       status: "active",
       address: address.trim(),
       pincode: pincode ? pincode.trim() : null,
@@ -311,7 +347,6 @@ export const createServiceProvider = async (c) => {
       updatedAt: new Date(),
     };
 
-    // 6. Query database using withDatabase wrapper
     const result = await withDatabase(mongoUri, async (db) => {
       const collection = db.collection("Service-Providers");
       return await collection.insertOne(newProvider);
@@ -319,7 +354,7 @@ export const createServiceProvider = async (c) => {
 
     return c.json({
       success: true,
-      message: "Service Provider created successfully with Wekan board.",
+      message: "Service Provider created successfully with Wekan board and R2 image storage.",
       data: {
         _id: result.insertedId,
         ...newProvider
@@ -490,56 +525,7 @@ export const getProviderTickets = async (c) => {
   }
 };
 
-export const getServiceProviderByMobile = async (c) => {
-  try {
-    // 1. Extract mobile number from query params
-    const mobile = c.req.query("mobile");
 
-    // 2. Validate input
-    if (!mobile) {
-      return c.json({
-        success: false,
-        message: "Mobile number is required as a query parameter."
-      }, 400);
-    }
-
-    const cleanMobile = mobile.trim();
-
-    // 3. Query database using withDatabase wrapper
-    const providers = await withDatabase(mongoUri, async (db) => {
-      const collection = db.collection("Service-Providers");
-
-      // Find all matching service provider profiles for this mobile
-      return await collection.find({ mobile: cleanMobile }).toArray();
-    });
-
-    // 4. Handle case where no record is found
-    if (!providers || providers.length === 0) {
-      return c.json({
-        success: false,
-        message: "No service provider profile found for this mobile number.",
-        count: 0,
-        data: []
-      }, 404);
-    }
-
-    // 5. Return success response
-    return c.json({
-      success: true,
-      message: `Successfully retrieved ${providers.length} service provider record(s).`,
-      count: providers.length,
-      data: providers
-    }, 200);
-
-  } catch (error) {
-    console.error("❌ Get Service Provider Controller Error:", error);
-    return c.json({
-      success: false,
-      message: "Internal Server Error",
-      error: error.message
-    }, 500);
-  }
-};
 
 const STATUS_TO_WEKAN_LIST = {
   "NEW": "New",
@@ -640,6 +626,181 @@ export const updateTicketStatus = async (c) => {
   }
 };
 
+export const addTicketBilling = async (c) => {
+  try {
+    // 1. Get Ticket MongoDB ID from route params
+    const ticketMongoId = c.req.param("id");
 
+    if (!ticketMongoId || !ObjectId.isValid(ticketMongoId)) {
+      return c.json({
+        success: false,
+        message: "Invalid or missing ticket ID format."
+      }, 400);
+    }
+
+    // 2. Parse dynamic billing payload from mobile request
+    let body = {};
+    try {
+      body = await c.req.json();
+    } catch (_) {
+      body = await c.req.parseBody();
+    }
+
+    // Accept either a nested billing object { billing: { ... } } or raw root key-values
+    const billingData = body.billing || body;
+
+    if (!billingData || Object.keys(billingData).length === 0) {
+      return c.json({
+        success: false,
+        message: "Billing details payload cannot be empty."
+      }, 400);
+    }
+
+    // 3. Update document in 'wekan-services' collection
+    const updatedRecord = await withDatabase(mongoUri, async (db) => {
+      const collection = db.collection("wekan-services");
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(ticketMongoId) },
+        {
+          $set: {
+            billing: billingData,
+            updatedAt: new Date()
+          }
+        },
+        { returnDocument: "after" }
+      );
+
+      return result;
+    });
+
+    if (!updatedRecord) {
+      return c.json({
+        success: false,
+        message: "Ticket not found with the provided ID."
+      }, 404);
+    }
+
+    return c.json({
+      success: true,
+      message: "Billing details attached and ticket marked as completed successfully.",
+      data: updatedRecord
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Add Ticket Billing Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to save billing information.",
+      error: error.message
+    }, 500);
+  }
+};
+
+export const getHomeServiceHistory = async (c) => {
+  try {
+    // 1. Get user identifier (phone or userId)
+    const phoneParam = c.req.param("phone") || c.req.query("phone");
+
+    if (!phoneParam) {
+      return c.json({
+        success: false,
+        message: "Customer phone number is required."
+      }, 400);
+    }
+
+    const cleanPhone = phoneParam.trim();
+    const numMobile = Number(cleanPhone);
+
+    const tickets = await withDatabase(mongoUri, async (db) => {
+      const usersCol = db.collection("Users");
+      const homesCol = db.collection("Homes");
+      const ticketsCol = db.collection("wekan-services");
+
+      // STEP A: Find User Document
+      const user = await usersCol.findOne({
+        $or: [
+          { mobile: cleanPhone },
+          { mobile: isNaN(numMobile) ? cleanPhone : numMobile }
+        ]
+      });
+
+      // STEP B: Find all Homes linked to this user or phone number
+      const homeQueryFilters = [
+        { mobile: cleanPhone }
+      ];
+
+      if (user) {
+        homeQueryFilters.push(
+          { ownerId: user._id },
+          { userId: user._id },
+          { members: user._id },
+          { memberIds: user._id }
+        );
+      }
+
+      const userHomes = await homesCol.find({ $or: homeQueryFilters }).toArray();
+
+      // STEP C: Collect all member User IDs & member mobile numbers across those homes
+      const memberUserIds = new Set();
+      const memberPhones = new Set([cleanPhone]);
+
+      userHomes.forEach((home) => {
+        if (home.ownerId) memberUserIds.add(home.ownerId.toString());
+        if (home.userId) memberUserIds.add(home.userId.toString());
+
+        const membersList = [...(home.members || []), ...(home.memberIds || [])];
+        membersList.forEach((mId) => {
+          if (mId) memberUserIds.add(mId.toString());
+        });
+
+        if (home.mobile) memberPhones.add(String(home.mobile).trim());
+      });
+
+      // Fetch user documents for all co-members to grab their mobile numbers as well
+      if (memberUserIds.size > 0) {
+        const objectIds = Array.from(memberUserIds)
+          .filter((id) => ObjectId.isValid(id))
+          .map((id) => new ObjectId(id));
+
+        const coMembers = await usersCol.find({ _id: { $in: objectIds } }).toArray();
+        coMembers.forEach((m) => {
+          if (m.mobile) memberPhones.add(String(m.mobile).trim());
+        });
+      }
+
+      // STEP D: Fetch all tickets raised by ANY household member
+      const homeObjectIds = userHomes.map((h) => h._id);
+      const homeStringIds = userHomes.map((h) => h._id.toString());
+      const allPhones = Array.from(memberPhones);
+
+      const records = await ticketsCol.find({
+        $or: [
+          { homeId: { $in: [...homeObjectIds, ...homeStringIds] } },
+          { "customerDetails.phone": { $in: allPhones } }
+        ]
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+      return records;
+    });
+
+    return c.json({
+      success: true,
+      message: "Household service history retrieved successfully.",
+      count: tickets.length,
+      data: tickets
+    }, 200);
+
+  } catch (error) {
+    console.error("❌ Get Home Service History Error:", error);
+    return c.json({
+      success: false,
+      message: "Failed to retrieve household service history.",
+      error: error.message
+    }, 500);
+  }
+};
 
 
