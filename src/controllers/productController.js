@@ -44,10 +44,10 @@ export const createProductSubmission = async (c) => {
 
     // 3. Database Operations across Decoupled Collections
     const result = await withDatabase(mongoUri, async (db) => {
-      const usersCol = db.collection("Users");
-      const homesCol = db.collection("Homes");
-      const roomsCol = db.collection("Rooms");
-      const devicesCol = db.collection("Devices");
+      const usersCol = db.collection("users");
+      const homesCol = db.collection("homes");
+      const roomsCol = db.collection("rooms");
+      const devicesCol = db.collection("devices");
 
       // --- STEP A: Upsert User Profile ---
       const numMobile = Number(cleanMobile);
@@ -220,7 +220,7 @@ export const updateEntity = async (c) => {
         if (pincode) homeUpdates.pincode = pincode;
         homeUpdates.updatedAt = new Date();
 
-        const res = await db.collection("Homes").updateOne(
+        const res = await db.collection("homes").updateOne(
           { _id: new ObjectId(homeId) },
           { $set: homeUpdates }
         );
@@ -234,7 +234,7 @@ export const updateEntity = async (c) => {
         if (brand) deviceUpdates.brand = brand;
         deviceUpdates.updatedAt = new Date();
 
-        const res = await db.collection("Devices").updateOne(
+        const res = await db.collection("devices").updateOne(
           { deviceId: deviceId },
           { $set: deviceUpdates }
         );
@@ -248,7 +248,7 @@ export const updateEntity = async (c) => {
           updatedAt: new Date()
         };
 
-        const res = await db.collection("Rooms").updateOne(
+        const res = await db.collection("rooms").updateOne(
           { _id: new ObjectId(roomId) },
           { $set: roomUpdates }
         );
@@ -315,8 +315,8 @@ export const addMember = async (c) => {
 
     // 3. Connect to database and process decoupled updates
     const result = await withDatabase(mongoUri, async (db) => {
-      const usersCollection = db.collection("Users");
-      const homesCollection = db.collection("Homes");
+      const usersCollection = db.collection("users");
+      const homesCollection = db.collection("homes");
 
       // A. Verify primary user exists in Users collection
       const requesterUser = await usersCollection.findOne({ mobile: cleanMyMobile });
@@ -412,7 +412,7 @@ export const deleteMember = async (c) => {
   const { mobile } = await c.req.json(); // Identify member by mobile number
 
   const result = await withDatabase(mongoUri, async (db) => {
-    return await db.collection('Home').updateOne(
+    return await db.collection('homes').updateOne(
       { _id: new ObjectId(homeId) },
       {
         $pull: {
@@ -435,7 +435,7 @@ export const deleteRoomProduct = async (c) => {
   const { roomName, product } = await c.req.json(); // e.g., roomName: "kitchen", product: "Laptop"
 
   const result = await withDatabase(mongoUri, async (db) => {
-    return await db.collection('Home').updateOne(
+    return await db.collection('homes').updateOne(
       { _id: new ObjectId(homeId) },
       {
         $pull: {
@@ -555,7 +555,7 @@ export const getSubmissionByMobile = async (c) => {
 
     const homes = await withDatabase(mongoUri, async (db) => {
       // 1. Fetch User by Mobile
-      const user = await db.collection("Users").findOne({
+      const user = await db.collection("users").findOne({
         $or: [
           { mobile: cleanMobile },
           { mobile: isNaN(numMobile) ? cleanMobile : numMobile }
@@ -570,7 +570,7 @@ export const getSubmissionByMobile = async (c) => {
       const userIdObj = user._id instanceof ObjectId ? user._id : new ObjectId(user._id);
 
       // 2. Aggregate Homes
-      const rawHomes = await db.collection("Homes").aggregate([
+      const rawHomes = await db.collection("homes").aggregate([
         // Match candidates
         {
           $match: {
@@ -637,7 +637,7 @@ export const getSubmissionByMobile = async (c) => {
         // Join Users
         {
           $lookup: {
-            from: "Users",
+            from: "users",
             let: { memberList: { $ifNull: ["$members", []] } },
             pipeline: [
               {
@@ -659,7 +659,7 @@ export const getSubmissionByMobile = async (c) => {
         // Join Rooms
         {
           $lookup: {
-            from: "Rooms",
+            from: "rooms",
             let: { hVariants: "$homeIdVariants" },
             pipeline: [
               {
@@ -675,7 +675,7 @@ export const getSubmissionByMobile = async (c) => {
         // Join Devices
         {
           $lookup: {
-            from: "Devices",
+            from: "devices",
             let: { hVariants: "$homeIdVariants" },
             pipeline: [
               {

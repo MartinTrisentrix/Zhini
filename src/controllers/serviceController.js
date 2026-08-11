@@ -87,7 +87,7 @@ export const getNearbyService = async (c) => {
 
       try {
         // Updated collection name to match createServiceProvider ("Service-Providers")
-        const providerCollection = db.collection('Service-Providers');
+        const providerCollection = db.collection('service-providers');
 
         // Match active providers strictly by pincode
         const matchingProviders = await providerCollection.find({
@@ -256,7 +256,7 @@ export const getServiceProviderByMobile = async (c) => {
 
     // 3. Query database using withDatabase wrapper
     const providers = await withDatabase(mongoUri, async (db) => {
-      const collection = db.collection("Service-Providers");
+      const collection = db.collection("service-providers");
 
       // Find all matching service provider profiles for this mobile
       return await collection.find({ mobile: cleanMobile }).toArray();
@@ -348,7 +348,7 @@ export const createServiceProvider = async (c) => {
     };
 
     const result = await withDatabase(mongoUri, async (db) => {
-      const collection = db.collection("Service-Providers");
+      const collection = db.collection("service-providers");
       return await collection.insertOne(newProvider);
     });
 
@@ -398,7 +398,7 @@ export const createServiceTicket = async (c) => {
     }
 
     const ticketResult = await withDatabase(mongoUri, async (db) => {
-      const providerCollection = db.collection("Service-Providers");
+      const providerCollection = db.collection("service-providers");
       const wekanServiceCollection = db.collection("wekan-services");
 
       const cleanProviderMobile = providerMobile.trim();
@@ -566,7 +566,7 @@ export const updateTicketStatus = async (c) => {
 
     const updatedTicket = await withDatabase(mongoUri, async (db) => {
       const wekanServiceCollection = db.collection("wekan-services");
-      const providerCollection = db.collection("Service-Providers");
+      const providerCollection = db.collection("service-providers");
 
       // 1. Fetch current ticket document from MongoDB
       const ticket = await wekanServiceCollection.findOne({ ticketId: ticketId.trim() });
