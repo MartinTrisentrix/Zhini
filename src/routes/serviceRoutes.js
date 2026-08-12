@@ -5,8 +5,10 @@ const serviceRouter = new Hono();
 
 
 serviceRouter.post('/service', getNearbyService);
+serviceRouter.post('/home-services', getNearbyHomeServices);
 
-serviceRouter.get('/home-services', getNearbyHomeServices);
+
+
 serviceRouter.post('/create-provider', createServiceProvider);
 
 serviceRouter.get('/provider', getServiceProviderByMobile);
