@@ -9,8 +9,9 @@ productRouter.post('/submit', createProductSubmission);
 productRouter.put('/update', updateEntity);
 
 productRouter.post('/member', addMember);
-
 productRouter.delete('/delete-member/:homeId', deleteMember);
+
+
 productRouter.delete('/delete-product/:homeId', deleteRoomProduct);
 
 
